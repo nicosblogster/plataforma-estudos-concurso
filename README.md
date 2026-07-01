@@ -2,6 +2,10 @@
 
 MVP local para organizar edital, materiais, tópicos, estudo, questões, simulados e revisões. O teste inicial usa o edital `SEDES DF 2026` anexado e cadastra o cargo `Pedagoga/Pedagogia`.
 
+## Prévia do dashboard
+
+![Dashboard da plataforma](docs/images/dashboard-preview.png)
+
 ## Funcionalidades atuais
 
 - Cadastro de concurso local.
@@ -29,6 +33,26 @@ MVP local para organizar edital, materiais, tópicos, estudo, questões, simulad
 - O modelo `gemma2:2b` é leve; serve para MVP, mas pode errar extrações longas ou complexas.
 - O banco é SQLite local em `data/estudos.db`.
 - A planilha verticalizada recebida está identificada como Administrativo; ela é arquivada como material, mas não substitui o mapa de Pedagogia.
+
+## Roadmap
+
+### v0.1.0 - MVP local publicado
+
+- Dashboard de acompanhamento com progresso, horas, questões, pontos fracos e revisões.
+- Upload e organização de edital e materiais de estudo.
+- Extração de texto de PDF, DOCX, Excel, CSV, TXT e imagens com OCR.
+- Banco local de questões e treino no estilo Quadrix.
+- Planejamento diário/semanal, revisão automática e relatório semanal.
+- Suporte opcional a IA local com Ollama `gemma2:2b`.
+
+### Próximas versões
+
+- Melhorar a tela de simulados com experiência questão por questão, cronômetro e resultado por bloco do edital.
+- Criar visão detalhada por tópico com materiais vinculados, histórico de erros e revisão sugerida.
+- Adicionar importação estruturada de bancos de questões em CSV/XLSX.
+- Gerar relatórios em PDF para acompanhamento semanal.
+- Evoluir o armazenamento local para sincronização opcional em PostgreSQL/Supabase.
+- Empacotar uma versão desktop mais simples para uso por usuários sem familiaridade com terminal.
 
 ## Instalar no Windows
 
