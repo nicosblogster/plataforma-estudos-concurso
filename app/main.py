@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import escape
 from pathlib import Path
 import sys
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,7 +49,14 @@ from app.planner import (
 from app.question_bank import attempts_summary, get_question_count, next_question, record_attempt, seed_question_bank
 from app.reports import weekly_report, weekly_report_markdown
 from app.seed_data import seed_real_edital
-from app.simulations import add_simulation_result, create_simulation, get_simulations, simulation_details
+from app.simulations import (
+    add_simulation_result,
+    create_simulation,
+    get_simulations,
+    record_simulation_answer,
+    simulation_details,
+    simulation_discipline_summary,
+)
 
 
 st.set_page_config(
@@ -259,15 +267,35 @@ def apply_theme() -> None:
         .strategy-card { background:#fff; border:1px solid #dfe5ec; border-radius:8px; padding:1rem; box-shadow:0 8px 22px rgba(15,23,42,.04); }
         .strategy-card strong { color:#0f172a; }
         .time-chip { display:inline-flex; align-items:center; justify-content:center; min-width:58px; border-radius:999px; background:#e6f3f3; color:#075e5a; font-weight:800; padding:.25rem .5rem; margin-right:.5rem; }
+        .sim-shell { background:#fff; border:1px solid #dfe5ec; border-radius:8px; padding:1.1rem; box-shadow:0 10px 28px rgba(15,23,42,.045); margin-bottom:1rem; }
+        .sim-hero { display:grid; grid-template-columns:1fr auto; gap:1rem; align-items:center; margin-bottom:1rem; }
+        .sim-title { font-size:1.15rem; font-weight:800; color:#0f172a; }
+        .sim-meta { color:#667085; font-size:.82rem; margin-top:.25rem; }
+        .sim-badge { border-radius:999px; background:#e6f3f3; color:#075e5a; font-weight:800; padding:.45rem .7rem; font-size:.78rem; }
+        .sim-stats { display:grid; grid-template-columns: repeat(4, minmax(130px,1fr)); gap:.75rem; margin:.85rem 0 1rem; }
+        .sim-stat { border:1px solid #e5e7eb; border-radius:8px; padding:.85rem; background:#f8fafc; }
+        .sim-stat-label { color:#667085; font-weight:700; font-size:.74rem; text-transform:uppercase; }
+        .sim-stat-value { color:#0f172a; font-size:1.35rem; font-weight:800; margin-top:.2rem; }
+        .question-card { border:1px solid #dfe5ec; border-radius:8px; padding:1rem; background:#fff; margin:.75rem 0; }
+        .question-statement { font-size:1rem; font-weight:700; line-height:1.55; color:#0f172a; margin:.75rem 0; }
+        .option-row { border:1px solid #e5e7eb; border-radius:8px; padding:.65rem .75rem; margin:.45rem 0; background:#f8fafc; }
+        .discipline-score-table { width:100%; border-collapse:separate; border-spacing:0; border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; font-size:.82rem; background:#fff; }
+        .discipline-score-table th { text-align:left; padding:.75rem; background:#f8fafc; border-bottom:1px solid #e5e7eb; color:#334155; }
+        .discipline-score-table td { padding:.75rem; border-bottom:1px solid #eef2f7; }
+        .discipline-score-table tr:last-child td { border-bottom:0; }
         @media (max-width: 1200px) {
             .metric-grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
             .strategy-grid { grid-template-columns: repeat(2, minmax(180px,1fr)); }
-            .dashboard-grid, .bottom-grid, .topbar, .command-strip { grid-template-columns: 1fr; }
+            .dashboard-grid, .bottom-grid, .topbar, .command-strip, .sim-hero, .sim-stats { grid-template-columns: 1fr; }
             .topbar { margin-top: 0; padding-top: .9rem; }
             .top-metrics { flex-wrap:wrap; }
         }
         @media (max-width: 640px) {
             .main .block-container { padding: 1rem 1rem 2rem 1rem; }
+            [data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {
+                min-width: 100vw !important;
+                width: 100vw !important;
+            }
             .topbar { margin-left: -1rem; margin-right: -1rem; padding-left: 1rem; padding-right: 1rem; }
             .exam-title { font-size: 1rem; }
             .top-item { border-right: 0; padding-right: 0; }
@@ -922,8 +950,315 @@ def _quick_questions_view(concurso_id: int) -> None:
             st.success("Resultado salvo.")
 
 
-def _simulation_view(concurso_id: int) -> None:
-    st.markdown("### Novo simulado")
+def _fmt_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _load_simulation_questions(concurso_id: int, total_questions: int, discipline: str | None) -> list[dict[str, object]]:
+    params: list[object] = [concurso_id, concurso_id]
+    where = "qb.concurso_id = ? AND t.concurso_id = ?"
+    if discipline:
+        where += " AND t.discipline = ?"
+        params.append(discipline)
+    params.append(total_questions)
+    rows = db.fetch_df(
+        f"""
+        SELECT qb.*, t.discipline, t.topic
+        FROM question_bank qb
+        JOIN topics t ON t.id = qb.topic_id
+        WHERE {where}
+        ORDER BY t.question_count DESC, qb.difficulty DESC, RANDOM()
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    return [dict(row) for _, row in rows.iterrows()]
+
+
+def _simulation_elapsed(state: dict[str, object]) -> int:
+    started_at = str(state.get("started_at") or datetime.now().isoformat())
+    try:
+        return int((datetime.now() - datetime.fromisoformat(started_at)).total_seconds())
+    except ValueError:
+        return 0
+
+
+def _render_timer_component(elapsed_seconds: int) -> None:
+    components.html(
+        f"""
+        <div style="font-family:Inter,Segoe UI,sans-serif;border:1px solid #dfe5ec;border-radius:8px;padding:12px 14px;background:#fff;box-shadow:0 8px 22px rgba(15,23,42,.04)">
+            <div style="font-size:11px;font-weight:800;color:#667085;text-transform:uppercase">Cronômetro</div>
+            <div id="sim-timer" style="font-size:28px;font-weight:900;color:#0f172a;margin-top:2px">00:00</div>
+        </div>
+        <script>
+            let seconds = {max(0, int(elapsed_seconds))};
+            const target = document.getElementById("sim-timer");
+            function renderTimer() {{
+                const h = Math.floor(seconds / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                const s = seconds % 60;
+                target.textContent = h > 0
+                    ? String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0")
+                    : String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+                seconds += 1;
+            }}
+            renderTimer();
+            setInterval(renderTimer, 1000);
+        </script>
+        """,
+        height=82,
+    )
+
+
+def _interactive_simulation_view(concurso_id: int, topics: pd.DataFrame) -> None:
+    state_key = f"interactive_simulation_{concurso_id}"
+    total_bank = get_question_count(concurso_id)
+    if total_bank == 0:
+        st.warning("Banco local vazio. Sincronize o banco local antes de iniciar um simulado interativo.")
+        if st.button("Sincronizar banco local para simulado", type="primary"):
+            created = seed_question_bank(concurso_id)
+            st.success(f"Banco sincronizado. {created} nova(s) questão(ões).")
+            st.rerun()
+        return
+
+    state = st.session_state.get(state_key)
+    if state and state.get("finished"):
+        _render_simulation_finish(concurso_id, state)
+        return
+
+    if not state or not state.get("active"):
+        st.markdown(
+            '<div class="status-note">Monte um simulado com questões reais do banco local. Cada erro cria revisão automática D+2 e alimenta o desempenho por disciplina.</div>',
+            unsafe_allow_html=True,
+        )
+        disciplines = ["Todas as disciplinas"] + sorted(topics["discipline"].dropna().unique().tolist())
+        with st.form("simulado_interativo_inicio"):
+            title = st.text_input("Título", value=f"Simulado interativo {date.today().strftime('%d/%m/%Y')}")
+            discipline_label = st.selectbox("Foco", disciplines)
+            max_questions = max(1, min(50, int(total_bank)))
+            total_questions = st.number_input("Quantidade de questões", min_value=1, max_value=max_questions, value=min(10, max_questions))
+            submitted = st.form_submit_button("Iniciar simulado", type="primary")
+        if submitted:
+            discipline = None if discipline_label == "Todas as disciplinas" else discipline_label
+            questions = _load_simulation_questions(concurso_id, int(total_questions), discipline)
+            if not questions:
+                st.error("Não há questões suficientes para esse filtro.")
+                return
+            sim_id = create_simulation(concurso_id, title, "simulado_interativo", f"Foco: {discipline_label}")
+            st.session_state[f"active_simulation_{concurso_id}"] = sim_id
+            st.session_state[state_key] = {
+                "active": True,
+                "finished": False,
+                "simulation_id": sim_id,
+                "title": title.strip(),
+                "questions": questions,
+                "index": 0,
+                "started_at": datetime.now().isoformat(),
+                "answers": [],
+                "current_answered": False,
+                "last_result": None,
+            }
+            st.rerun()
+        _render_simulation_results(concurso_id)
+        return
+
+    questions = list(state.get("questions") or [])
+    index = int(state.get("index") or 0)
+    answers = list(state.get("answers") or [])
+    elapsed = _simulation_elapsed(state)
+    score = sum(float(item.get("score_delta", 0.0)) for item in answers)
+    correct = sum(1 for item in answers if item.get("is_correct"))
+    errors = sum(1 for item in answers if not item.get("is_correct") and not item.get("skipped"))
+    skipped = sum(1 for item in answers if item.get("skipped"))
+
+    if not questions or index >= len(questions):
+        state["active"] = False
+        state["finished"] = True
+        st.session_state[state_key] = state
+        _render_simulation_finish(concurso_id, state)
+        return
+
+    question = questions[index]
+    st.markdown(
+        f"""
+        <div class="sim-shell">
+            <div class="sim-hero">
+                <div>
+                    <div class="sim-title">{_safe(state.get("title", "Simulado interativo"))}</div>
+                    <div class="sim-meta">Questão {index + 1} de {len(questions)} · pontuação Quadrix: +1 acerto, -0,5 erro, 0 pular</div>
+                </div>
+                <div class="sim-badge">#{int(state["simulation_id"])}</div>
+            </div>
+            <div class="sim-stats">
+                <div class="sim-stat"><div class="sim-stat-label">Pontuação</div><div class="sim-stat-value">{score:.1f}</div></div>
+                <div class="sim-stat"><div class="sim-stat-label">Acertos</div><div class="sim-stat-value">{correct}</div></div>
+                <div class="sim-stat"><div class="sim-stat-label">Erros</div><div class="sim-stat-value">{errors}</div></div>
+                <div class="sim-stat"><div class="sim-stat-label">Puladas</div><div class="sim-stat-value">{skipped}</div></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _render_timer_component(elapsed)
+
+    st.markdown(
+        f"""
+        <div class="question-card">
+            <div class="sim-meta"><strong>{_safe(question.get("discipline", ""))}</strong> · {_safe(question.get("topic", ""))}</div>
+            <div class="question-statement">{_safe(question.get("statement", ""))}</div>
+            <div class="option-row"><strong>A)</strong> {_safe(question.get("option_a", ""))}</div>
+            <div class="option-row"><strong>B)</strong> {_safe(question.get("option_b", ""))}</div>
+            <div class="option-row"><strong>C)</strong> {_safe(question.get("option_c", ""))}</div>
+            <div class="option-row"><strong>D)</strong> {_safe(question.get("option_d", ""))}</div>
+            <div class="option-row"><strong>E)</strong> {_safe(question.get("option_e", ""))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    answer_key = f"interactive_answer_{concurso_id}_{state['simulation_id']}_{index}"
+    answer = st.radio("Resposta", ["A", "B", "C", "D", "E", "Pular"], horizontal=True, key=answer_key)
+
+    col1, col2, col3 = st.columns([1, 1, 1.2])
+    if col1.button("Corrigir", type="primary", key=f"correct_sim_{concurso_id}_{state['simulation_id']}_{index}"):
+        if state.get("current_answered"):
+            st.info("Esta questão já foi corrigida. Avance para a próxima.")
+        else:
+            result = record_simulation_answer(concurso_id, int(state["simulation_id"]), question, answer, elapsed)
+            result.update(
+                {
+                    "question_id": int(question["id"]),
+                    "topic_id": int(question["topic_id"]),
+                    "discipline": str(question.get("discipline", "")),
+                    "topic": str(question.get("topic", "")),
+                    "justification": str(question.get("justification", "")),
+                }
+            )
+            answers.append(result)
+            state["answers"] = answers
+            state["current_answered"] = True
+            state["last_result"] = result
+            complete_matching_tasks(concurso_id, int(question["topic_id"]), date.today(), ("questoes",))
+            st.session_state[state_key] = state
+            st.rerun()
+
+    if col2.button("Próxima", key=f"next_sim_{concurso_id}_{state['simulation_id']}_{index}"):
+        if not state.get("current_answered"):
+            st.warning("Corrija ou pule a questão antes de avançar.")
+        else:
+            state["index"] = index + 1
+            state["current_answered"] = False
+            state["last_result"] = None
+            st.session_state[state_key] = state
+            st.rerun()
+
+    if col3.button("Encerrar e ver resultado", key=f"finish_sim_{concurso_id}_{state['simulation_id']}"):
+        state["active"] = False
+        state["finished"] = True
+        st.session_state[state_key] = state
+        st.rerun()
+
+    last_result = state.get("last_result")
+    if last_result:
+        if last_result.get("skipped"):
+            st.info(f"Questão pulada. Gabarito: {last_result['expected']}.")
+        elif last_result.get("is_correct"):
+            st.success(f"Você acertou. Gabarito: {last_result['expected']}.")
+        else:
+            st.error(f"Você errou. Gabarito: {last_result['expected']}. Revisão D+2 criada automaticamente.")
+        st.markdown("**Justificativa**")
+        st.write(last_result.get("justification", ""))
+
+
+def _render_simulation_finish(concurso_id: int, state: dict[str, object]) -> None:
+    elapsed = _simulation_elapsed(state)
+    answers = list(state.get("answers") or [])
+    score = sum(float(item.get("score_delta", 0.0)) for item in answers)
+    total_answered = sum(1 for item in answers if not item.get("skipped"))
+    correct = sum(1 for item in answers if item.get("is_correct"))
+    accuracy = round(100 * correct / total_answered, 1) if total_answered else 0
+    st.markdown(
+        f"""
+        <div class="sim-shell">
+            <div class="sim-title">Resultado do simulado #{int(state.get("simulation_id", 0))}</div>
+            <div class="sim-meta">Tempo total: {_fmt_seconds(elapsed)} · Questões corrigidas: {len(answers)}</div>
+            <div class="sim-stats">
+                <div class="sim-stat"><div class="sim-stat-label">Pontuação Quadrix</div><div class="sim-stat-value">{score:.1f}</div></div>
+                <div class="sim-stat"><div class="sim-stat-label">Acertos</div><div class="sim-stat-value">{correct}</div></div>
+                <div class="sim-stat"><div class="sim-stat-label">Taxa</div><div class="sim-stat-value">{accuracy}%</div></div>
+                <div class="sim-stat"><div class="sim-stat-label">Revisões geradas</div><div class="sim-stat-value">{sum(1 for item in answers if not item.get("is_correct") and not item.get("skipped"))}</div></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _render_simulation_results(concurso_id, int(state.get("simulation_id", 0)))
+    if st.button("Criar novo simulado interativo", type="primary"):
+        st.session_state.pop(f"interactive_simulation_{concurso_id}", None)
+        st.rerun()
+
+
+def _render_simulation_results(concurso_id: int, simulation_id: int | None = None) -> None:
+    sims = get_simulations(concurso_id)
+    if sims.empty:
+        return
+    if simulation_id is None:
+        simulation_id = int(sims.iloc[0]["id"])
+    summary = simulation_discipline_summary(int(simulation_id))
+    if not summary.empty:
+        rows = []
+        for _, row in summary.iterrows():
+            total = int(row.get("total_questions", 0) or 0)
+            correct = int(row.get("correct_answers", 0) or 0)
+            accuracy = float(row.get("accuracy", 0) or 0)
+            errors = int(row.get("errors", 0) or 0)
+            rows.append(
+                f"<tr><td>{_safe(row['discipline'])}</td><td>{total}</td><td>{correct}</td><td><span class='score-pill'>{accuracy:.1f}%</span></td><td>{errors}</td></tr>"
+            )
+        st.markdown("### Resultado por disciplina")
+        st.markdown(
+            "<table class='discipline-score-table'><thead><tr><th>Disciplina</th><th>Questões</th><th>Acertos</th><th>Taxa</th><th>Erros</th></tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table>",
+            unsafe_allow_html=True,
+        )
+
+    details = simulation_details(int(simulation_id))
+    if not details.empty:
+        details = details.copy()
+        totals = pd.to_numeric(details["total_questions"], errors="coerce").fillna(0)
+        correct = pd.to_numeric(details["correct_answers"], errors="coerce").fillna(0)
+        details["accuracy"] = ((correct / totals.where(totals > 0)) * 100).fillna(0).round(1)
+        st.markdown("### Itens registrados")
+        st.markdown(
+            _render_simulation_table(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": int(simulation_id),
+                            "simulation_date": date.today().isoformat(),
+                            "title": f"{row['discipline']} - {row['topic']}",
+                            "mode": "questao_interativa",
+                            "total_questions": int(row["total_questions"]),
+                            "correct_answers": int(row["correct_answers"]),
+                            "accuracy": float(row["accuracy"]),
+                        }
+                        for _, row in details.iterrows()
+                    ]
+                ),
+                empty_message="Nenhum item registrado.",
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def _manual_simulation_view(concurso_id: int, topics: pd.DataFrame) -> None:
+    st.markdown("### Novo simulado manual")
     topics = db.fetch_df(
         "SELECT id, discipline, topic FROM topics WHERE concurso_id = ? ORDER BY question_count DESC, discipline, topic",
         (concurso_id,),
@@ -1001,6 +1336,21 @@ def _simulation_view(concurso_id: int) -> None:
     history["accuracy"] = ((correct_history / totals_history.where(totals_history > 0)) * 100).fillna(0).round(1)
     st.markdown("### Histórico")
     st.markdown(_render_simulation_table(history), unsafe_allow_html=True)
+
+
+def _simulation_view(concurso_id: int) -> None:
+    topics = db.fetch_df(
+        "SELECT id, discipline, topic, question_count FROM topics WHERE concurso_id = ? ORDER BY question_count DESC, discipline, topic",
+        (concurso_id,),
+    )
+    if topics.empty:
+        st.warning("Cadastre tópicos antes de registrar simulado.")
+        return
+    tab_interactive, tab_manual = st.tabs(["Simulado interativo", "Manual e histórico"])
+    with tab_interactive:
+        _interactive_simulation_view(concurso_id, topics)
+    with tab_manual:
+        _manual_simulation_view(concurso_id, topics)
 
 
 def planning_view(concurso_id: int) -> None:
